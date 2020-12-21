@@ -156,13 +156,9 @@ def conv_downsample_2d(x, w, k=None, factor=2, gain=1, impl='ref'):
     k = _setup_kernel(k) * gain
     p = (k.shape[0] - factor) + (w.shape[-1] - 1)
 
-    num_groups = x.shape[1] // w.shape[1]  # batch size
-
-    x = x.view(num_groups, -1, x.shape[2], x.shape[3])
     x = _simple_upfirdn_2d(x, k, pad0=(p + 1) // 2, pad1=p // 2, impl=impl)
-    x = x.view(1, -1, x.shape[2], x.shape[3])
-    x = F.conv2d(x, w, stride=factor, groups=num_groups)
-    return x.view(num_groups, -1, x.shape[2], x.shape[3])
+    x = F.conv2d(x, w, stride=factor)
+    return x
 
 
 # ----------------------------------------------------------------------------

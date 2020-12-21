@@ -56,7 +56,7 @@ class G_main(nn.Module):
         """
         :param latents_in: Latent vectors (Z) [minibatch, latent_size].
         :param labels_in: Conditioning labels [minibatch, label_size].
-        :return: images_out: Generated images [minibatch, num_channels, resolution, resolution] (see G_synthesis_stylegan2)
+        :return: images_out: Generated images [minibatch, num_channels, resolution, resolution] (see G_synthesis_stylegan2).
         """
         assert latents_in.dtype == torch.float32, "Data type of latents_in is wrong."
         # Evaluate mapping network.
@@ -147,7 +147,7 @@ class G_mapping(nn.Module):
         """
         :param latents_in: Latent vectors (Z) [minibatch, latent_size].
         :param labels_in: Conditioning labels [minibatch, label_size].
-        :return: dlatents: Disentangled latent (W) [minibatch, dlatent_broadcast, latent_size].
+        :return: dlatents: Disentangled latents (W) [minibatch, dlatent_broadcast, latent_size].
         """
         # Inputs.
         if labels_in is not None:
@@ -244,7 +244,7 @@ class G_synthesis_stylegan2(nn.Module):
     def forward(self, dlatents_in, resolution_log2=None):
         """
         :param dlatents_in: Disentangled latents (W) [minibatch, num_layers, dlatent_size].
-        :return: images_out: Generated images [minibatch, num_channels, resolution, resolution]
+        :return: images_out: Generated images [minibatch, num_channels, resolution, resolution].
         """
         if resolution_log2 is not None:
             self.resolution_log2 = resolution_log2
@@ -346,9 +346,9 @@ class ModulatedConv2dLayer(nn.Module):
 
     def forward(self, x, dlatent):
         """
-        :param x: Convolution weights [minibatch, fmaps_in, height, width]
-        :param dlatent: Disentangled latent of an layer [minibatch, dlatent_size].
-        :return:
+        :param x: Feature maps [minibatch, fmaps_in, height, width].
+        :param dlatent: Disentangled latent of one layer [minibatch, dlatent_size].
+        :return: x: Feature maps [minibatch, fmaps_out, new_height, new_width].
         """
         batch_size, fmaps_in, height, width = x.shape
 
@@ -374,3 +374,189 @@ class ModulatedConv2dLayer(nn.Module):
             x = F.conv2d(x, conv_weight, padding=self.padding, groups=batch_size)
             x = x.view(batch_size, self.fmaps_out, x.shape[2], x.shape[3])
         return x
+
+
+# ----------------------------------------------------------------------------
+# StyleGAN2 discriminator.
+class D_stylegan2(nn.Module):
+    """Implements residual nets."""
+    def __init__(self,
+                 num_channels=3,                # Number of input color channels. Overridden based on dataset.
+                 resolution=1024,               # Input resolution. Overridden based on dataset.
+                 label_size=0,                  # Dimensionality of the labels, 0 if no labels. Overridden based on dataset.
+                 fmap_base=16 << 10,            # Overall multiplier for the number of feature maps.
+                 fmap_decay=1.0,                # log2 feature map reduction when doubling the resolution.
+                 fmap_min=1,                    # Minimum number of feature maps in any layer.
+                 fmap_max=512,                  # Maximum number of feature maps in any layer.
+                 architecture='resnet',         # Architecture: 'orig', 'skip', 'resnet'.
+                 mbstd_group_size=4,            # Group size for the minibatch standard deviation layer, 0 = disable.
+                 mbstd_num_features=1,          # Number of features for the minibatch standard deviation layer.
+                 dtype=torch.float32,           # Data type to use for activations and outputs.
+                 resample_kernel=[1,3,3,1],     # Low-pass filter to apply when resampling activations. None = no filtering.
+                 **_kwargs):                    # Ignore unrecognized keyword args.
+        super(D_stylegan2, self).__init__()
+
+        self.resolution_log2 = int(np.log2(resolution))
+        assert resolution == 2 ** self.resolution_log2 and resolution >= 4
+        self.fmap_base = fmap_base
+        self.fmap_decay = fmap_decay
+        self.fmap_min = fmap_min
+        self.fmap_max = fmap_max
+        self.architecture = architecture
+        self.mbstd_group_size = mbstd_group_size
+        self.mbstd_num_features = mbstd_num_features
+        self.dtype = dtype
+        self.resample_kernel = resample_kernel
+
+        # Main layers.
+        self.fromrgb = Conv2dLayer(fmaps_in=num_channels, fmaps_out=self.nf(9), kernel=1)
+        self.convs = nn.ModuleList()
+        self.resnets = nn.ModuleList()
+        fmaps_in = self.nf(9)
+        for res in range(self.resolution_log2, 2, -1):
+            fmaps_out = self.nf(res - 2)
+            self.convs.append(Conv2dLayer(fmaps_in=fmaps_in, fmaps_out=fmaps_in, kernel=3))
+            self.convs.append(Conv2dLayer(fmaps_in=fmaps_in, fmaps_out=fmaps_out, kernel=3, down=True, resample_kernel=self.resample_kernel))
+            self.resnets.append(Conv2dLayer(fmaps_in=fmaps_in, fmaps_out=fmaps_out, kernel=1, down=True, resample_kernel=self.resample_kernel, bias=False, act="linear"))
+            fmaps_in = fmaps_out
+
+        # Final layers.
+        self.stddev = MinibatchStddevLayer(self.mbstd_group_size, self.mbstd_num_features)
+        self.conv = Conv2dLayer(fmaps_in=self.nf(1)+1, fmaps_out=self.nf(1), kernel=3)
+        self.dense = DenseLayer(fmaps_in=self.nf(1)*4*4, fmaps_out=self.nf(0))
+
+        # Output layer with label conditioning from "Which Training Methods for GANs do actually Converge?"
+        fmaps_out = label_size if label_size > 1 else 1
+        self.dense_last = DenseLayer(fmaps_in=self.nf(0), fmaps_out=fmaps_out, act="linear")
+
+    def nf(self, stage):
+        return np.clip(int(self.fmap_base / (2.0 ** (stage * self.fmap_decay))), self.fmap_min, self.fmap_max)
+
+    def forward(self, images_in, labels_in):
+        """
+        :param images_in: Images [minibatch, num_channels, resolution, resolution]. Must be the output of G_main.
+        :param labels_in: Labels [minibatch, label_size].
+        :return: scores_out: Scores [minibatch, 1].
+        """
+        # Main layers.
+        x = None
+        y = images_in
+        for res in range(self.resolution_log2, 2, -1):
+            if res == self.resolution_log2:
+                x = self.fromrgb(y)
+            t = x
+            x = self.convs[(10 - res) * 2](x)
+            x = self.convs[(10 - res) * 2 + 1](x)
+            t = self.resnets[10 - res](t)
+            x = (x + t) * (1 / np.sqrt(2))
+
+        # Final layers.
+        if self.mbstd_group_size > 1:
+            x = self.stddev(x)
+        x = self.conv(x)
+        x = x.view(x.shape[0], -1)
+        x = self.dense(x)
+
+        # Output layer.
+        x = self.dense_last(x)
+        if labels_in is not None:
+            x = torch.sum(x * labels_in, dim=1, keepdim=True)
+        scores_out = x
+
+        # Output.
+        assert scores_out.dtype == self.dtype
+        return scores_out
+
+
+# ----------------------------------------------------------------------------
+class DenseLayer(nn.Module):
+    def __init__(self,
+                 fmaps_in,
+                 fmaps_out,
+                 act="lrelu"):
+        super(DenseLayer, self).__init__()
+
+        self.weight = nn.Parameter(torch.randn([fmaps_out, fmaps_in]))
+        self.runtime_coef = 1 / np.sqrt(fmaps_in)
+        self.bias = nn.Parameter(torch.zeros([1, fmaps_out]))
+        self.act = act
+
+    def forward(self, x):
+        x = F.linear(x, weight=self.weight * self.runtime_coef)
+        x = x + self.bias
+        if self.act == "lrelu":
+            x = F.leaky_relu(x, negative_slope=0.2) * np.sqrt(2)
+        return x
+
+
+# ----------------------------------------------------------------------------
+class Conv2dLayer(nn.Module):
+    def __init__(self,
+                 fmaps_in,
+                 fmaps_out,
+                 kernel,
+                 up=False,
+                 down=False,
+                 resample_kernel=None,
+                 bias=True,
+                 act="lrelu"):
+        super(Conv2dLayer, self).__init__()
+
+        self.fmaps_in = fmaps_in
+        self.fmaps_out = fmaps_out
+        self.kernel = kernel
+        self.up = up
+        self.down = down
+        self.resample_kernel = resample_kernel
+        self.padding = self.kernel // 2
+
+        self.conv_weight = nn.Parameter(torch.randn([self.fmaps_out, self.fmaps_in, self.kernel, self.kernel]))
+        self.runtime_coef = 1 / np.sqrt(self.kernel * self.kernel * self.fmaps_in)
+        if bias:
+            self.bias = nn.Parameter(torch.zeros([1, fmaps_out, 1, 1]))
+        else:
+            self.bias = None
+        self.act = act
+
+    def forward(self, x):
+        """
+        :param x: Feature maps [minibatch, fmaps_in, height, width].
+        :return: x: Feature maps [minibatch, fmaps_out, new_height, new_width].
+        """
+        batch_size = x.shape[0]
+        conv_weight = self.conv_weight * self.runtime_coef
+        if self.up:
+            x = upsample_conv_2d(x, conv_weight, k=self.resample_kernel)
+        elif self.down:
+            x = conv_downsample_2d(x, conv_weight, k=self.resample_kernel)
+        else:
+            x = F.conv2d(x, conv_weight, padding=self.padding)
+            x = x.view(batch_size, self.fmaps_out, x.shape[2], x.shape[3])
+        if self.bias is not None:
+            x = x + self.bias
+        if self.act == "lrelu":
+            x = F.leaky_relu(x, negative_slope=0.2) * np.sqrt(2)
+        return x
+
+
+# ----------------------------------------------------------------------------
+class MinibatchStddevLayer(nn.Module):
+    def __init__(self,
+                 group_size=4,
+                 num_new_features=1):
+        super(MinibatchStddevLayer, self).__init__()
+
+        self.group_size = group_size
+        self.num_new_features = num_new_features
+
+    def forward(self, x):
+        group_size = min(self.group_size, x.shape[0])  # Minibatch must be divisible by (or smaller than) group_size.
+        s = x.shape  # [NCHW]  Input shape.
+        y = x.reshape(group_size, -1, self.num_new_features, s[1] // self.num_new_features, s[2], s[3])  # [GMncHW] Split minibatch into M groups of size G. Split channels into n channel groups c.
+        y = y - torch.mean(y, dim=0, keepdim=True)  # [GMncHW] Subtract mean over group.
+        y = torch.mean(torch.square(y), dim=0)  # [MncHW]  Calc variance over group.
+        y = torch.sqrt(y + 1e-8)  # [MncHW]  Calc stddev over group.
+        y = torch.mean(y, dim=[2, 3, 4], keepdim=True)  # [Mn111]  Take average over fmaps and pixels.
+        y = torch.mean(y, dim=[2])  # [Mn11] Split channels into c channel groups
+        y = y.repeat(group_size, 1, s[2], s[3])  # [NnHW]  Replicate over group and pixels.
+        return torch.cat((x, y), dim=1)  # [NCHW]  Append as new fmap.
